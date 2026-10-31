@@ -36,6 +36,7 @@ lazysvn update v0.1.0
 - Shows `svn log -l 20` for the selected file
 - Marks multiple files for actions
 - Runs `svn commit`, `svn add`, `svn revert`, and `svn update`
+- Removes files from the working copy (filesystem `rm`, with confirmation)
 
 ## Run
 
@@ -94,7 +95,7 @@ brew uninstall lazysvn
 - `space` or `Enter`: mark/unmark file
 - `d`: diff selected file
 - `+`: toggle diff view (side-by-side / unified)
-- `l`: show log for selected file
+- `l`: open the file log for the selected file (navigate revisions; `→` focuses the diff pane)
 - `L` or `Tab`: switch to the `SVN log(L)` tab
 - `C`: switch back to the `变化(C)` tab
 - `↑` at the top of a list: focus the tab bar; `←`/`→` select a tab, `↓`/`Enter` returns to content
@@ -103,6 +104,7 @@ brew uninstall lazysvn
 - `c`: commit marked files (or current file)
 - `a`: add marked/selected unversioned files (`?`)
 - `v`: revert marked/current file (with confirmation)
+- `D`: remove marked/current file from the filesystem (confirmation shows file names; directories not supported)
 - `u`: update working copy
 - `r`: refresh status
 - `h` or `?`: help

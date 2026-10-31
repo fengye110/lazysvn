@@ -63,6 +63,7 @@ type actionMsg struct {
 	title   string
 	body    string
 	refresh bool
+	failed  bool
 }
 
 type changedPath struct {
@@ -97,6 +98,8 @@ type logListMsg struct {
 	entries []logEntry
 	raw     string
 	err     error
+	fileLog bool
+	path    string
 }
 
 type logDiffMsg struct {
@@ -122,13 +125,30 @@ type model struct {
 	commitInput  textinput.Model
 	commitPaths  []string
 
+	commitPrevTitle string
+	commitPrevBody  string
+
 	revertConfirm bool
 	revertPaths   []string
+
+	revertPrevTitle string
+	revertPrevBody  string
+
+	deleteConfirm bool
+	deletePaths   []string
+
+	deletePrevTitle string
+	deletePrevBody  string
 
 	diffSplit bool
 	tabFocus  bool
 
+	statusLoading bool
+	statusErr     bool
+
 	mode         uiMode
+	fileLog      bool
+	fileLogPath  string
 	logEntries   []logEntry
 	logCursor    int
 	logFocus     uiFocus
@@ -212,17 +232,20 @@ func main() {
 
 func initialModel() model {
 	ti := textinput.New()
-	ti.Placeholder = "提交信息"
+	// 不使用 textinput.Placeholder：bubbles v0.21.0 在 Width<=0 时
+	// placeholderView 只分配 1 个 rune，导致占位文案只显示第一个字。
+	// 占位提示由 renderFooter 自行渲染。
 	ti.Prompt = "> "
 	ti.CharLimit = 200
 
 	return model{
-		marked:       map[string]struct{}{},
-		previewTitle: "帮助",
-		previewBody:  helpText(),
-		statusLine:   "正在加载 SVN 状态...",
-		commitInput:  ti,
-		diffSplit:    true,
+		marked:        map[string]struct{}{},
+		previewTitle:  "帮助",
+		previewBody:   helpText(),
+		statusLine:    "正在加载 SVN 状态...",
+		commitInput:   ti,
+		diffSplit:     true,
+		statusLoading: true,
 	}
 }
 
@@ -238,13 +261,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statusMsg:
+		m.statusLoading = false
 		if msg.err != nil {
+			m.statusErr = true
 			m.statusLine = "svn status 执行失败。"
 			m.previewTitle = "SVN 错误"
 			m.previewBody = formatSVNResult([]string{"status"}, msg.raw, msg.err)
 			return m, nil
 		}
-
+		m.statusErr = false
 		m.entries = msg.entries
 		m.cleanupMarks()
 		if len(m.entries) == 0 {
@@ -277,17 +302,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.previewTitle = m.prevTitle
 				m.previewBody = m.prevBody
 			}
+			m.fileLog = false
+			m.fileLogPath = ""
 			m.statusLine = "日志加载失败。"
 			m.previewTitle = "SVN 错误"
-			m.previewBody = formatSVNResult([]string{"log", "--xml", "-v", "-l", "20", "."}, msg.raw, msg.err)
+			args := []string{"log", "--xml", "-v", "-l", "20", "."}
+			if msg.fileLog {
+				args = []string{"log", "--xml", "-l", "20", msg.path}
+			}
+			m.previewBody = formatSVNResult(args, msg.raw, msg.err)
 			return m, nil
 		}
 		m.mode = modeLog
+		m.fileLog = msg.fileLog
+		m.fileLogPath = msg.path
 		m.logEntries = msg.entries
 		m.logCursor = 0
 		m.logFocus = focusLeft
 		m.logDiff = ""
 		m.logDiffTitle = ""
+		if msg.fileLog {
+			if len(msg.entries) == 0 {
+				m.statusLine = "没有日志记录。"
+				return m, nil
+			}
+			return m, m.selectFileLogRevisionCmd()
+		}
 		m.selectLogRevision()
 		if len(msg.entries) == 0 {
 			m.statusLine = "没有日志记录。"
@@ -305,12 +345,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case actionMsg:
 		m.previewTitle = msg.title
 		m.previewBody = msg.body
-		if strings.Contains(strings.ToLower(msg.body), "error") {
+		if msg.failed || strings.Contains(strings.ToLower(msg.body), "error") {
 			m.statusLine = "操作失败。"
 		} else {
 			m.statusLine = "操作完成。"
 		}
 		if msg.refresh {
+			m.statusLoading = true
+			m.statusErr = false
 			return m, fetchStatusCmd()
 		}
 		return m, nil
@@ -321,6 +363,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.commitPrompt = false
 				m.commitInput.Blur()
+				// 恢复进入提交前右侧的预览内容
+				m.previewTitle = m.commitPrevTitle
+				m.previewBody = m.commitPrevBody
 				m.statusLine = "已取消提交。"
 				return m, nil
 			case "enter":
@@ -341,6 +386,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.deleteConfirm {
+			switch msg.String() {
+			case "y":
+				paths := append([]string(nil), m.deletePaths...)
+				m.deleteConfirm = false
+				m.statusLine = "正在删除文件..."
+				return m, deleteFilesCmd(paths)
+			case "n", "esc":
+				m.deleteConfirm = false
+				m.previewTitle = m.deletePrevTitle
+				m.previewBody = m.deletePrevBody
+				m.statusLine = "已取消删除。"
+				return m, nil
+			}
+			return m, nil
+		}
+
 		if m.revertConfirm {
 			switch msg.String() {
 			case "y":
@@ -350,6 +412,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, revertCmd(paths)
 			case "n", "esc":
 				m.revertConfirm = false
+				m.previewTitle = m.revertPrevTitle
+				m.previewBody = m.revertPrevBody
 				m.statusLine = "已取消还原。"
 				return m, nil
 			}
@@ -404,6 +468,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			m.statusLine = "刷新中..."
+			m.statusLoading = true
+			m.statusErr = false
 			return m, fetchStatusCmd()
 		case "enter":
 			m.toggleMark()
@@ -422,8 +488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusLine = "未选择文件。"
 				return m, nil
 			}
-			m.statusLine = "正在加载日志..."
-			return m, logCmd(path)
+			return m, m.openFileLog(path)
 		case "L":
 			return m, m.openLogTab(true)
 		case "tab":
@@ -447,14 +512,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusLine = "未选择文件。"
 				return m, nil
 			}
+			m.revertPrevTitle = m.previewTitle
+			m.revertPrevBody = m.previewBody
 			m.revertConfirm = true
 			m.revertPaths = targets
+			m.previewTitle = "待还原文件"
+			m.previewBody = m.revertPreview(targets)
+			m.statusLine = "等待确认还原。"
+			return m, nil
+		case "D":
+			targets := m.selectedTargets()
+			if len(targets) == 0 {
+				m.statusLine = "未选择文件。"
+				return m, nil
+			}
+			// 暂不支持目录删除
+			for _, p := range targets {
+				if info, err := os.Stat(p); err == nil && info.IsDir() {
+					m.statusLine = fmt.Sprintf("暂不支持删除目录：%s", p)
+					return m, nil
+				}
+			}
+			m.deletePrevTitle = m.previewTitle
+			m.deletePrevBody = m.previewBody
+			m.deleteConfirm = true
+			m.deletePaths = targets
+			m.previewTitle = "待删除文件"
+			m.previewBody = m.deletePreview(targets)
+			m.statusLine = "等待确认删除。"
 			return m, nil
 		case "c":
+			m.commitPrevTitle = m.previewTitle
+			m.commitPrevBody = m.previewBody
 			m.commitPaths = m.commitTargets()
 			m.commitPrompt = true
 			m.commitInput.SetValue("")
 			m.commitInput.Focus()
+			m.previewTitle = "待提交文件"
+			m.previewBody = m.commitPreview(m.commitPaths)
 			m.statusLine = fmt.Sprintf("提交 %d 个路径，请输入提交信息。", len(m.commitPaths))
 			return m, nil
 		case "h", "?":
@@ -478,6 +573,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.fileLog {
+		return m.handleFileLogKey(msg)
+	}
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -609,11 +707,130 @@ func (m model) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleFileLogKey 处理文件日志模式（l）的按键：
+// 左侧日志列表、右侧选中版本的当前文件差异，→/← 在两侧切换焦点。
+func (m model) handleFileLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "esc":
+		if m.logFocus == focusRight {
+			m.logFocus = focusLeft
+			m.statusLine = "已返回日志列表。"
+			return m, nil
+		}
+		m.exitLogMode()
+		return m, nil
+	case "tab":
+		// Tab 只用于在两个 tab 之间切换
+		return m, m.switchTab(false)
+	case "left":
+		if m.logFocus == focusRight {
+			m.logFocus = focusLeft
+			m.statusLine = "已返回日志列表。"
+		}
+		return m, nil
+	case "right":
+		if m.logFocus == focusLeft && len(m.logEntries) > 0 {
+			m.logFocus = focusRight
+			m.statusLine = "已切换到差异窗口。"
+		}
+		return m, nil
+	case "up":
+		if m.logCursor == 0 {
+			if m.logFocus == focusLeft {
+				m.tabFocus = true
+			}
+			return m, nil
+		}
+		m.logCursor--
+		return m, m.selectFileLogRevisionCmd()
+	case "k":
+		if m.logCursor > 0 {
+			m.logCursor--
+			return m, m.selectFileLogRevisionCmd()
+		}
+		return m, nil
+	case "down", "j":
+		if m.logCursor < len(m.logEntries)-1 {
+			m.logCursor++
+			return m, m.selectFileLogRevisionCmd()
+		}
+		return m, nil
+	case "g", "home":
+		if m.logCursor != 0 {
+			m.logCursor = 0
+			return m, m.selectFileLogRevisionCmd()
+		}
+		return m, nil
+	case "G", "end":
+		if len(m.logEntries) > 0 && m.logCursor != len(m.logEntries)-1 {
+			m.logCursor = len(m.logEntries) - 1
+			return m, m.selectFileLogRevisionCmd()
+		}
+		return m, nil
+	case "enter":
+		if m.logFocus == focusLeft {
+			if len(m.logEntries) == 0 {
+				return m, nil
+			}
+			m.logFocus = focusRight
+		}
+		return m, m.selectFileLogRevisionCmd()
+	case "L":
+		return m, m.openLogTab(true)
+	case "C":
+		return m, m.switchTab(false)
+	case "+":
+		m.diffSplit = !m.diffSplit
+		if m.diffSplit {
+			m.statusLine = "差异视图：左右对比。"
+		} else {
+			m.statusLine = "差异视图：统一格式。"
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// selectFileLogRevisionCmd 切换选中的日志版本，加载该版本中当前文件的差异。
+func (m *model) selectFileLogRevisionCmd() tea.Cmd {
+	if m.logCursor < 0 || m.logCursor >= len(m.logEntries) {
+		return nil
+	}
+	entry := m.logEntries[m.logCursor]
+	m.logPathsRev = entry.Revision
+	m.pathCursor = 0
+	m.logDiff = ""
+	m.logDiffTitle = ""
+	m.statusLine = fmt.Sprintf("正在加载 r%d 的差异...", entry.Revision)
+	return fileLogDiffCmd(entry.Revision, m.fileLogPath)
+}
+
 func (m model) logFilePreviewCmd() tea.Cmd {
 	if len(m.logPaths) == 0 {
 		return nil
 	}
 	return logFileDiffCmd(m.logPathsRev, m.logPaths[m.pathCursor].Path)
+}
+
+// openFileLog 进入文件日志模式：左侧该文件的日志列表，右侧选中版本的差异。
+func (m *model) openFileLog(path string) tea.Cmd {
+	m.prevTitle = m.previewTitle
+	m.prevBody = m.previewBody
+	m.mode = modeLog
+	m.fileLog = true
+	m.fileLogPath = path
+	m.logEntries = nil
+	m.logCursor = 0
+	m.logFocus = focusLeft
+	m.logPaths = nil
+	m.logPathsRev = 0
+	m.pathCursor = 0
+	m.logDiff = ""
+	m.logDiffTitle = ""
+	m.statusLine = "正在加载日志..."
+	return fetchFileLogCmd(path)
 }
 
 func (m *model) openLogTab(reload bool) tea.Cmd {
@@ -622,6 +839,13 @@ func (m *model) openLogTab(reload bool) tea.Cmd {
 		m.prevBody = m.previewBody
 	}
 	m.mode = modeLog
+
+	// 从文件日志切到完整日志 tab 时不能复用单文件日志缓存
+	if m.fileLog {
+		m.fileLog = false
+		m.fileLogPath = ""
+		reload = true
+	}
 
 	if !reload && len(m.logEntries) > 0 {
 		// 复用缓存：保留上次的版本/文件光标、布局与 diff
@@ -671,6 +895,19 @@ func (m *model) exitLogMode() {
 	}
 	// 只切回 Changes tab，保留日志缓存（版本/文件光标、布局、diff），
 	// 下次进入 SVN log 时恢复上次位置。
+	// 文件日志是临时模式，退出时清空缓存，避免污染完整日志 tab
+	if m.fileLog {
+		m.logEntries = nil
+		m.logCursor = 0
+		m.logPaths = nil
+		m.logPathsRev = 0
+		m.pathCursor = 0
+		m.logDiff = ""
+		m.logDiffTitle = ""
+		m.logFocus = focusLeft
+		m.fileLog = false
+		m.fileLogPath = ""
+	}
 	m.mode = modeChanges
 	m.previewTitle = m.prevTitle
 	m.previewBody = m.prevBody
@@ -812,6 +1049,10 @@ func focusedPaneStyle(focused bool) lipgloss.Style {
 
 func (m model) renderLeftPane(contentWidth, contentHeight int) string {
 	if m.mode == modeLog {
+		// 文件日志：左侧固定为日志列表
+		if m.fileLog {
+			return m.renderLogPane(contentWidth, contentHeight)
+		}
 		// 焦点在文件列表时布局交换：Files 在左，Diff 在右
 		if m.logFocus == focusRight {
 			return m.renderLogFilesPane(contentWidth, contentHeight, !m.tabFocus)
@@ -823,8 +1064,12 @@ func (m model) renderLeftPane(contentWidth, contentHeight int) string {
 
 func (m model) renderRightPane(contentWidth, contentHeight int) string {
 	if m.mode == modeLog {
+		// 文件日志：右侧固定为选中版本的差异
+		if m.fileLog {
+			return m.renderLogDiffPane(contentWidth, contentHeight, m.logFocus == focusRight && !m.tabFocus)
+		}
 		if m.logFocus == focusRight {
-			return m.renderLogDiffPane(contentWidth, contentHeight)
+			return m.renderLogDiffPane(contentWidth, contentHeight, false)
 		}
 		return m.renderLogFilesPane(contentWidth, contentHeight, false)
 	}
@@ -840,11 +1085,14 @@ func (m model) renderLogPane(contentWidth, contentHeight int) string {
 	rows := max(1, contentHeight)
 
 	title := fmt.Sprintf("SVN 日志 (%d)", len(m.logEntries))
+	if m.fileLog {
+		title = fmt.Sprintf("文件日志 (%d)", len(m.logEntries))
+	}
 	if m.logFocus == focusLeft {
 		title += " [焦点]"
 	}
 	titleLine := title
-	if len(m.logPaths) > 0 {
+	if len(m.logPaths) > 0 || m.fileLog {
 		titleLine += "  " + diffCloseHint.Render("→ 右键切换到右侧")
 	}
 	lines := []string{renderPaneTitle(titleLine, "Esc 退出日志模式", innerWidth)}
@@ -935,8 +1183,8 @@ func (m model) renderLogFilesPane(contentWidth, contentHeight int, focused bool)
 	return border.Render(strings.Join(lines, "\n"))
 }
 
-func (m model) renderLogDiffPane(contentWidth, contentHeight int) string {
-	border := focusedPaneStyle(false).
+func (m model) renderLogDiffPane(contentWidth, contentHeight int, focused bool) string {
+	border := focusedPaneStyle(focused).
 		Width(contentWidth).
 		Height(contentHeight)
 
@@ -978,7 +1226,14 @@ func (m model) renderChangesPane(contentWidth, contentHeight int) string {
 	}
 	lines := []string{renderPaneTitleMid("变化", mid, "选中待操作文件后操作", innerWidth)}
 	if len(m.entries) == 0 {
-		lines = append(lines, "工作副本干净。")
+		switch {
+		case m.statusLoading:
+			lines = append(lines, "正在加载变更...")
+		case m.statusErr:
+			lines = append(lines, "svn status 执行失败，按 r 重试。")
+		default:
+			lines = append(lines, "工作副本干净。")
+		}
 		return border.Render(strings.Join(lines, "\n"))
 	}
 
@@ -1002,6 +1257,20 @@ func (m model) renderChangesPane(contentWidth, contentHeight int) string {
 	return border.Render(strings.Join(lines, "\n"))
 }
 
+// isRuleLine 判断该行是否为分隔线（仅由 - 或 = 组成，长度至少 3）。
+func isRuleLine(line string) bool {
+	t := strings.TrimSpace(line)
+	if len(t) < 3 {
+		return false
+	}
+	for _, r := range t {
+		if r != '-' && r != '=' {
+			return false
+		}
+	}
+	return true
+}
+
 func (m model) renderPreviewPane(contentWidth, contentHeight int) string {
 	border := focusedPaneStyle(false).
 		Width(contentWidth).
@@ -1021,7 +1290,18 @@ func (m model) renderPreviewPane(contentWidth, contentHeight int) string {
 	} else {
 		lines = []string{truncate(m.previewTitle, innerWidth)}
 		for _, line := range strings.Split(strings.ReplaceAll(m.previewBody, "\r\n", "\n"), "\n") {
-			lines = append(lines, truncate(line, innerWidth))
+			// svn log 等输出的分隔线只有分隔语义，截断到面板宽度即可；
+			// 若走软换行会被拆成两行（第二行残留几个 "-"）。
+			if isRuleLine(line) {
+				if len(line) > innerWidth {
+					line = line[:innerWidth]
+				}
+				lines = append(lines, line)
+				continue
+			}
+			// 普通文本（svn 输出/错误信息/帮助等）按面板宽度软换行，
+			// 避免长路径、长错误消息被截断成 "…" 而看不全。
+			lines = append(lines, strings.Split(ansi.WrapWc(line, innerWidth, "/"), "\n")...)
 		}
 	}
 	if len(lines) > rows {
@@ -1263,16 +1543,54 @@ func colorizeDiffLine(line string) string {
 }
 
 func (m model) renderFooter(width int) string {
-	help := "j/k 移动  空格 标记  d 差异  l 日志  h 帮助  c 提交  a 添加  v 还原  u 更新  r 刷新  q 退出"
+	help := "j/k 移动  空格 标记  d 差异  l 日志  h 帮助  c 提交  a 添加  v 还原  D 删除  u 更新  r 刷新  q 退出"
 	if m.commitPrompt {
-		text := truncate(fmt.Sprintf("提交（%d 个路径）：%s", len(m.commitPaths), m.commitInput.View()), max(8, width))
+		var prefix string
+		switch {
+		case len(m.commitPaths) == 1 && m.commitPaths[0] == ".":
+			prefix = "提交当前工作副本："
+		case len(m.commitPaths) == 1:
+			prefix = fmt.Sprintf("提交 %s：", m.commitPaths[0])
+		default:
+			prefix = fmt.Sprintf("提交 %d 个文件：%s：", len(m.commitPaths), strings.Join(m.commitPaths, "、"))
+		}
+
+		text := prefix + m.commitInput.View()
+		if m.commitInput.Value() == "" {
+			text += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).
+				Render("提交信息（输入后回车提交，Esc 取消）")
+		}
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("11")).
-			Render(text)
+			Render(truncate(text, max(8, width)))
+	}
+	if m.deleteConfirm {
+		names := strings.Join(m.deletePaths, "、")
+		risk := ""
+		if m.hasLocalModifications(m.deletePaths) {
+			risk = "（本地修改将丢失）"
+		}
+		text := fmt.Sprintf("删除文件 %s%s？此操作不可撤销，按 y 确认，n 或 Esc 取消。", names, risk)
+		if len(m.deletePaths) > 1 {
+			text = fmt.Sprintf("删除 %d 个文件%s：%s？此操作不可撤销，按 y 确认，n 或 Esc 取消。", len(m.deletePaths), risk, names)
+		}
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).
+			Render(truncate(text, max(8, width)))
 	}
 	if m.revertConfirm {
-		text := truncate(fmt.Sprintf("还原 %d 个路径？按 y 或 n。", len(m.revertPaths)), max(8, width))
+		names := strings.Join(m.revertPaths, "、")
+		risk := ""
+		if m.hasLocalModifications(m.revertPaths) {
+			risk = "（本地修改将丢失）"
+		}
+
+		var text string
+		if len(m.revertPaths) > 1 {
+			text = fmt.Sprintf("还原 %d 个文件%s：%s？按 y 确认，n 或 Esc 取消。", len(m.revertPaths), risk, names)
+		} else {
+			text = fmt.Sprintf("还原 %s%s？按 y 确认，n 或 Esc 取消。", names, risk)
+		}
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("11")).
-			Render(text)
+			Render(truncate(text, max(8, width)))
 	}
 	text := truncate(fmt.Sprintf("%s | %s", help, m.statusLine), max(8, width))
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).
@@ -1327,6 +1645,24 @@ func (m *model) cleanupMarks() {
 	}
 }
 
+// hasLocalModifications 判断目标中是否有带本地修改（M）的文件。
+// 删除有本地修改的文件会丢弃这些修改，需要在确认提示中明确告知。
+func (m model) hasLocalModifications(paths []string) bool {
+	wanted := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		wanted[p] = struct{}{}
+	}
+	for _, e := range m.entries {
+		if e.Code != 'M' {
+			continue
+		}
+		if _, ok := wanted[e.Path]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (m model) selectedTargets() []string {
 	if len(m.marked) > 0 {
 		targets := make([]string, 0, len(m.marked))
@@ -1348,6 +1684,51 @@ func (m model) commitTargets() []string {
 		return targets
 	}
 	return []string{"."}
+}
+
+// statusPathList 生成带 svn status 状态码的路径列表。
+func (m model) statusPathList(paths []string) string {
+	codes := make(map[string]rune, len(m.entries))
+	for _, e := range m.entries {
+		codes[e.Path] = e.Code
+	}
+
+	var b strings.Builder
+	for _, p := range paths {
+		if code, ok := codes[p]; ok {
+			fmt.Fprintf(&b, "  %c  %s\n", code, p)
+		} else {
+			fmt.Fprintf(&b, "     %s\n", p)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// commitPreview 生成右侧预览面板的待提交文件列表。
+func (m model) commitPreview(paths []string) string {
+	if len(paths) == 1 && paths[0] == "." {
+		return "未选择具体文件，将提交当前工作副本。"
+	}
+	if len(paths) == 0 {
+		return "（无待提交文件）"
+	}
+	return fmt.Sprintf("待提交文件（%d 个）：\n\n", len(paths)) + m.statusPathList(paths)
+}
+
+// revertPreview 生成右侧预览面板的待还原文件列表。
+func (m model) revertPreview(paths []string) string {
+	if len(paths) == 0 {
+		return "（无待还原文件）"
+	}
+	return fmt.Sprintf("待还原文件（%d 个）：\n\n", len(paths)) + m.statusPathList(paths)
+}
+
+// deletePreview 生成右侧预览面板的待删除文件列表。
+func (m model) deletePreview(paths []string) string {
+	if len(paths) == 0 {
+		return "（无待删除文件）"
+	}
+	return fmt.Sprintf("待删除文件（%d 个）：\n\n", len(paths)) + m.statusPathList(paths)
 }
 
 func (m model) addTargets() []string {
@@ -1438,17 +1819,6 @@ func diffCmd(path string) tea.Cmd {
 	}
 }
 
-func logCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		args := []string{"log", "-l", "20", path}
-		out, err := runSVN(args...)
-		return previewMsg{
-			title: "SVN 日志: " + path,
-			body:  formatSVNResult(args, out, err),
-		}
-	}
-}
-
 func fetchLogCmd() tea.Cmd {
 	return func() tea.Msg {
 		args := []string{"log", "--xml", "-v", "-l", "20", "."}
@@ -1461,6 +1831,22 @@ func fetchLogCmd() tea.Cmd {
 			return logListMsg{raw: out, err: parseErr}
 		}
 		return logListMsg{entries: entries}
+	}
+}
+
+// fetchFileLogCmd 加载单个文件的日志（只包含影响该文件的版本）。
+func fetchFileLogCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		args := []string{"log", "--xml", "-l", "20", path}
+		out, err := runSVN(args...)
+		if err != nil {
+			return logListMsg{raw: out, err: err, fileLog: true, path: path}
+		}
+		entries, parseErr := parseLogXML(out)
+		if parseErr != nil {
+			return logListMsg{raw: out, err: parseErr, fileLog: true, path: path}
+		}
+		return logListMsg{entries: entries, fileLog: true, path: path}
 	}
 }
 
@@ -1522,6 +1908,20 @@ func logFileDiffCmd(revision int64, path string) tea.Cmd {
 	}
 }
 
+// fileLogDiffCmd 查看文件在指定版本中的差异（使用工作副本路径，不依赖 ^/）。
+func fileLogDiffCmd(revision int64, path string) tea.Cmd {
+	return func() tea.Msg {
+		args := []string{"diff", "-c", strconv.FormatInt(revision, 10), "-x", "-U" + strconv.Itoa(diffContextLines), path}
+		out, err := runSVN(args...)
+		return logDiffMsg{
+			revision: revision,
+			path:     path,
+			title:    fmt.Sprintf("差异: r%d %s", revision, path),
+			body:     formatSVNResult(args, out, err),
+		}
+	}
+}
+
 func updateCmd() tea.Cmd {
 	return func() tea.Msg {
 		args := []string{"update"}
@@ -1558,6 +1958,43 @@ func revertCmd(paths []string) tea.Cmd {
 	}
 }
 
+// deleteFilesCmd 直接从文件系统删除文件（os.Remove），不经过 svn delete。
+// 这样未版本化文件（?）与带本地修改的文件（M）都能删除；
+// 版本控制文件删除后 svn status 会显示为 !（missing）。
+func deleteFilesCmd(paths []string) tea.Cmd {
+	return func() tea.Msg {
+		quoted := make([]string, 0, len(paths))
+		for _, p := range paths {
+			quoted = append(quoted, shellQuoteArg(p))
+		}
+
+		var b strings.Builder
+		b.WriteString("$ rm ")
+		b.WriteString(strings.Join(quoted, " "))
+		b.WriteString("\n\n")
+
+		failed := 0
+		for _, p := range paths {
+			if err := os.Remove(p); err != nil {
+				failed++
+				fmt.Fprintf(&b, "删除失败：%s\n  %v\n", p, err)
+				continue
+			}
+			fmt.Fprintf(&b, "已删除：%s\n", p)
+		}
+		if failed > 0 {
+			fmt.Fprintf(&b, "\n%d 个文件删除失败。\n", failed)
+		}
+
+		return actionMsg{
+			title:   "删除文件",
+			body:    strings.TrimSpace(b.String()),
+			refresh: true,
+			failed:  failed > 0,
+		}
+	}
+}
+
 func commitCmd(paths []string, message string) tea.Cmd {
 	return func() tea.Msg {
 		args := []string{"commit", "-m", message}
@@ -1579,6 +2016,17 @@ func parseStatus(out string) []statusEntry {
 			continue
 		}
 		if len(line) < 2 {
+			continue
+		}
+		// 跳过 svn status 的附加说明行，避免被当成文件条目
+		if strings.HasPrefix(line, "        >") ||
+			strings.HasPrefix(line, "Summary of conflicts:") {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Tree conflicts:") ||
+			strings.HasPrefix(trimmed, "Text conflicts:") ||
+			strings.HasPrefix(trimmed, "Property conflicts:") {
 			continue
 		}
 		code := rune(line[0])
@@ -1604,7 +2052,8 @@ func parseStatus(out string) []statusEntry {
 }
 
 func runSVN(args ...string) (string, error) {
-	cmd := exec.Command("svn", args...)
+	// --non-interactive：避免 svn 在 TUI 中等待认证输入而卡住
+	cmd := exec.Command("svn", append([]string{"--non-interactive"}, args...)...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -1612,10 +2061,26 @@ func runSVN(args ...string) (string, error) {
 	return strings.TrimRight(buf.String(), "\n"), err
 }
 
+// shellQuoteArg 用于展示命令行：含空格或 shell 特殊字符的参数用双引号包起来，
+// 避免用户输入（如提交信息）在展示时看起来像被拆成多个参数。
+func shellQuoteArg(arg string) string {
+	if arg == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(arg, " \t\n\r\"'\\$`&|;<>()*?[]{}!#~") {
+		return arg
+	}
+	return strconv.Quote(arg)
+}
+
 func formatSVNResult(args []string, out string, err error) string {
 	var b strings.Builder
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteArg(arg))
+	}
 	b.WriteString("$ svn ")
-	b.WriteString(strings.Join(args, " "))
+	b.WriteString(strings.Join(quoted, " "))
 	b.WriteString("\n\n")
 	if strings.TrimSpace(out) != "" {
 		b.WriteString(out)
@@ -1658,7 +2123,7 @@ LazySVN 按键：
   g / G          顶部 / 底部
   空格 / 回车     标记 / 取消标记
   d              查看选中文件差异
-  l              查看文件最近 20 条日志
+  l              文件日志（→ 查看差异）
   L 或 Tab       打开 SVN 日志 tab
   C              切回变化 tab
   列表顶部 ↑      聚焦 tab 栏，←/→ 选择
@@ -1669,6 +2134,7 @@ LazySVN 按键：
   c              提交标记文件（或当前）
   a              添加未版本化文件（?）
   v              还原标记/当前文件（需确认）
+  D              删除文件（需确认，暂不支持目录）
   u              svn update
   r              刷新状态
   h 或 ?          显示帮助
