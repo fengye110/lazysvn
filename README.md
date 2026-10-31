@@ -91,9 +91,15 @@ brew uninstall lazysvn
 
 - `j` / `k` or arrows: move
 - `g` / `G`: top / bottom
-- `space`: mark/unmark file
-- `d` or `Enter`: diff selected file
+- `space` or `Enter`: mark/unmark file
+- `d`: diff selected file
+- `+`: toggle diff view (side-by-side / unified)
 - `l`: show log for selected file
+- `L` or `Tab`: switch to the `SVN log(L)` tab
+- `C`: switch back to the `变化(C)` tab
+- `↑` at the top of a list: focus the tab bar; `←`/`→` select a tab, `↓`/`Enter` returns to content
+- `Tab`: toggle between the `变化(C)` and `SVN log(L)` tabs
+- In log view: `j`/`k` move revisions, `Enter`/`→` opens the file list, `j`/`k` previews each file's diff, `+` toggles side-by-side/unified, `←`/`→` switch focus, `←`/`Esc` returns to the log layout
 - `c`: commit marked files (or current file)
 - `a`: add marked/selected unversioned files (`?`)
 - `v`: revert marked/current file (with confirmation)
